@@ -1,0 +1,16 @@
+
+services:
+  pushfeed:
+    # 多架构镜像支持：linux/amd64, linux/arm64
+    image: vitoegg/pushfeed:latest
+    container_name: pushfeed
+    restart: always
+    volumes:
+      - ./data:/app/data  # 数据持久化目录
+    environment:
+      - TELEGRAM_BOT_TOKEN=bot_token  # 机器人token，通过@BotFather 创建
+      - ROOT_ID=admin_id  # 管理员id，通过@userinfobot 获取
+      - WHITELIST_GROUP_ID=-123456  # 白名单群组id，默认-123456
+      - ENABLE_GROUP_VERIFY=false  # 白名单群组验证，默认关闭，参数为true/false
+      - UPDATE_INTERVAL=30  # RSS源抓取间隔，单位：秒，默认300s
+
