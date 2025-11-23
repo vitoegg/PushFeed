@@ -1,4 +1,4 @@
-name: 构建多架构Docker镜像
+name: Build Docker Image
 
 on:
   # 每天UTC时间00:00自动运行
@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       force_build:
-        description: '强制构建（忽略上游更新检查）'
+        description: 'Forced Build'
         required: false
         type: boolean
         default: false
@@ -19,24 +19,24 @@ env:
   DOCKER_IMAGE: vitoegg/pushfeed
 
 jobs:
-  check-and-build:
+  multi-arch-docker-builder:
     runs-on: ubuntu-latest
     
     steps:
       # 检出当前仓库（用于缓存commit信息）
-      - name: 检出当前仓库
+      - name: Checkout current repository
         uses: actions/checkout@v4
       
       # 获取上游仓库最新commit SHA
-      - name: 获取上游最新commit
+      - name: Get latest commit from upstream repository
         id: upstream
         run: |
           LATEST_COMMIT=$(curl -s https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/commits/main | jq -r '.sha')
           echo "latest_commit=$LATEST_COMMIT" >> $GITHUB_OUTPUT
-          echo "上游最新commit: $LATEST_COMMIT"
+          echo "Upstream latest commit: $LATEST_COMMIT"
       
       # 恢复上次构建的commit缓存
-      - name: 恢复构建缓存
+      - name: Restore build cache
         id: cache
         uses: actions/cache@v3
         with:
@@ -46,47 +46,47 @@ jobs:
             build-commit-
       
       # 检查是否需要构建
-      - name: 检查是否需要构建
+      - name: Check if build is needed
         id: should_build
         run: |
           if [ "${{ github.event.inputs.force_build }}" == "true" ]; then
-            echo "强制构建模式"
+            echo "Forced build mode"
             echo "should_build=true" >> $GITHUB_OUTPUT
           elif [ -f .last_build_commit ]; then
             LAST_COMMIT=$(cat .last_build_commit)
-            echo "上次构建commit: $LAST_COMMIT"
+            echo "Last build commit: $LAST_COMMIT"
             if [ "$LAST_COMMIT" != "${{ steps.upstream.outputs.latest_commit }}" ]; then
-              echo "检测到上游更新，需要构建"
+              echo "Detected upstream update, need to build"
               echo "should_build=true" >> $GITHUB_OUTPUT
             else
-              echo "上游无更新，跳过构建"
+              echo "No upstream update, skip build"
               echo "should_build=false" >> $GITHUB_OUTPUT
             fi
           else
-            echo "首次构建"
+            echo "First build"
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
       
       # 克隆上游仓库
-      - name: 克隆上游仓库
+      - name: Clone upstream repository
         if: steps.should_build.outputs.should_build == 'true'
         run: |
           git clone https://github.com/${{ env.UPSTREAM_REPO }}.git upstream
           cd upstream
-          echo "克隆完成，当前commit: $(git rev-parse HEAD)"
+          echo "Clone completed, current commit: $(git rev-parse HEAD)"
       
       # 设置QEMU（用于多架构构建）
-      - name: 设置QEMU
+      - name: Setup QEMU
         if: steps.should_build.outputs.should_build == 'true'
         uses: docker/setup-qemu-action@v3
       
       # 设置Docker Buildx
-      - name: 设置Docker Buildx
+      - name: Setup Docker Buildx
         if: steps.should_build.outputs.should_build == 'true'
         uses: docker/setup-buildx-action@v3
       
       # 登录Docker Hub
-      - name: 登录Docker Hub
+      - name: Login to Docker Hub
         if: steps.should_build.outputs.should_build == 'true'
         uses: docker/login-action@v3
         with:
@@ -94,16 +94,16 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
       
       # 提取commit短SHA（用于版本标签）
-      - name: 提取版本信息
+      - name: Extract version information
         if: steps.should_build.outputs.should_build == 'true'
         id: meta
         run: |
           SHORT_SHA=$(echo ${{ steps.upstream.outputs.latest_commit }} | cut -c1-7)
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
-          echo "版本标签: $SHORT_SHA"
+          echo "Version label: $SHORT_SHA"
       
       # 构建并推送多架构镜像
-      - name: 构建并推送Docker镜像
+      - name: Build and push Docker image
         if: steps.should_build.outputs.should_build == 'true'
         uses: docker/build-push-action@v5
         with:
@@ -118,21 +118,21 @@ jobs:
           cache-to: type=gha,mode=max
       
       # 保存本次构建的commit
-      - name: 保存构建记录
+      - name: Save build record
         if: steps.should_build.outputs.should_build == 'true'
         run: |
           echo "${{ steps.upstream.outputs.latest_commit }}" > .last_build_commit
-          echo "构建完成，记录commit: ${{ steps.upstream.outputs.latest_commit }}"
+          echo "Build completed, record commit: ${{ steps.upstream.outputs.latest_commit }}"
       
       # 输出构建结果
-      - name: 输出构建结果
+      - name: Output build result
         if: steps.should_build.outputs.should_build == 'true'
         run: |
           echo "============================================"
-          echo "构建成功！"
-          echo "镜像: ${{ env.DOCKER_IMAGE }}:latest"
-          echo "版本: ${{ env.DOCKER_IMAGE }}:${{ steps.meta.outputs.short_sha }}"
-          echo "支持架构: linux/amd64, linux/arm64"
-          echo "上游commit: ${{ steps.upstream.outputs.latest_commit }}"
+          echo "Build successful!"
+          echo "Image: ${{ env.DOCKER_IMAGE }}:latest"
+          echo "Version: ${{ env.DOCKER_IMAGE }}:${{ steps.meta.outputs.short_sha }}"
+          echo "Supported architectures: linux/amd64, linux/arm64"
+          echo "Upstream commit: ${{ steps.upstream.outputs.latest_commit }}"
           echo "============================================"
 
