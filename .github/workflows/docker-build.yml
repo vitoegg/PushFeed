@@ -27,26 +27,68 @@ jobs:
       - name: Checkout current repository
         uses: actions/checkout@v4
       
-      # 获取上游仓库最新commit SHA
-      - name: Get latest commit from upstream repository
-        id: upstream
+      # 克隆上游仓库（带重试机制）
+      - name: Clone upstream repository
+        id: clone
         run: |
-          LATEST_COMMIT=$(curl -s https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/commits/main | jq -r '.sha')
-          echo "latest_commit=$LATEST_COMMIT" >> $GITHUB_OUTPUT
-          echo "Upstream latest commit: $LATEST_COMMIT"
+          MAX_RETRIES=3
+          RETRY_DELAY=10
+          
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Attempt $i of $MAX_RETRIES: Cloning upstream repository..."
+            
+            if git clone --depth 1 https://github.com/${{ env.UPSTREAM_REPO }}.git upstream 2>&1; then
+              cd upstream
+              COMMIT_SHA=$(git rev-parse HEAD)
+              
+              # 验证commit SHA格式
+              if [[ "$COMMIT_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+                echo "Clone successful!"
+                echo "Current commit: $COMMIT_SHA"
+                echo "clone_success=true" >> $GITHUB_OUTPUT
+                echo "latest_commit=$COMMIT_SHA" >> $GITHUB_OUTPUT
+                exit 0
+              else
+                echo "Error: Invalid commit SHA format"
+                rm -rf ../upstream
+              fi
+            else
+              echo "Clone failed, cleaning up..."
+              rm -rf upstream
+            fi
+            
+            if [ $i -lt $MAX_RETRIES ]; then
+              echo "Waiting ${RETRY_DELAY}s before retry..."
+              sleep $RETRY_DELAY
+            fi
+          done
+          
+          echo "All clone attempts failed"
+          echo "clone_success=false" >> $GITHUB_OUTPUT
+      
+      # 克隆失败时优雅退出
+      - name: Check clone result
+        if: steps.clone.outputs.clone_success != 'true'
+        run: |
+          echo "============================================"
+          echo "Warning: Failed to clone upstream repository"
+          echo "This run will be skipped gracefully"
+          echo "============================================"
       
       # 恢复上次构建的commit缓存
       - name: Restore build cache
+        if: steps.clone.outputs.clone_success == 'true'
         id: cache
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: .last_build_commit
-          key: build-commit-${{ steps.upstream.outputs.latest_commit }}
+          key: build-commit-${{ steps.clone.outputs.latest_commit }}
           restore-keys: |
             build-commit-
       
       # 检查是否需要构建
       - name: Check if build is needed
+        if: steps.clone.outputs.clone_success == 'true'
         id: should_build
         run: |
           if [ "${{ github.event.inputs.force_build }}" == "true" ]; then
@@ -55,7 +97,7 @@ jobs:
           elif [ -f .last_build_commit ]; then
             LAST_COMMIT=$(cat .last_build_commit)
             echo "Last build commit: $LAST_COMMIT"
-            if [ "$LAST_COMMIT" != "${{ steps.upstream.outputs.latest_commit }}" ]; then
+            if [ "$LAST_COMMIT" != "${{ steps.clone.outputs.latest_commit }}" ]; then
               echo "Detected upstream update, need to build"
               echo "should_build=true" >> $GITHUB_OUTPUT
             else
@@ -67,13 +109,14 @@ jobs:
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
       
-      # 克隆上游仓库
-      - name: Clone upstream repository
+      # 生成版本标签（日期+运行号，不依赖API）
+      - name: Generate version tag
         if: steps.should_build.outputs.should_build == 'true'
+        id: meta
         run: |
-          git clone https://github.com/${{ env.UPSTREAM_REPO }}.git upstream
-          cd upstream
-          echo "Clone completed, current commit: $(git rev-parse HEAD)"
+          VERSION_TAG=$(date -u +%Y%m%d)${{ github.run_number }}
+          echo "version_tag=$VERSION_TAG" >> $GITHUB_OUTPUT
+          echo "Version label: $VERSION_TAG"
       
       # 设置QEMU（用于多架构构建）
       - name: Setup QEMU
@@ -85,26 +128,19 @@ jobs:
         if: steps.should_build.outputs.should_build == 'true'
         uses: docker/setup-buildx-action@v3
       
-      # 登录Docker Hub
+      # 登录Docker Hub（带重试）
       - name: Login to Docker Hub
         if: steps.should_build.outputs.should_build == 'true'
+        id: docker_login
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
       
-      # 提取commit短SHA（用于版本标签）
-      - name: Extract version information
-        if: steps.should_build.outputs.should_build == 'true'
-        id: meta
-        run: |
-          SHORT_SHA=$(echo ${{ steps.upstream.outputs.latest_commit }} | cut -c1-7)
-          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
-          echo "Version label: $SHORT_SHA"
-      
       # 构建并推送多架构镜像
       - name: Build and push Docker image
         if: steps.should_build.outputs.should_build == 'true'
+        id: docker_build
         uses: docker/build-push-action@v5
         with:
           context: ./upstream
@@ -113,35 +149,35 @@ jobs:
           push: true
           tags: |
             ${{ env.DOCKER_IMAGE }}:latest
-            ${{ env.DOCKER_IMAGE }}:${{ steps.meta.outputs.short_sha }}
+            ${{ env.DOCKER_IMAGE }}:${{ steps.meta.outputs.version_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       
-      # 保存本次构建的commit
+      # 保存本次构建的commit（仅在构建成功后）
       - name: Save build record
-        if: steps.should_build.outputs.should_build == 'true'
+        if: steps.should_build.outputs.should_build == 'true' && steps.docker_build.outcome == 'success'
         run: |
-          echo "${{ steps.upstream.outputs.latest_commit }}" > .last_build_commit
-          echo "Build completed, record commit: ${{ steps.upstream.outputs.latest_commit }}"
+          echo "${{ steps.clone.outputs.latest_commit }}" > .last_build_commit
+          echo "Build record saved: ${{ steps.clone.outputs.latest_commit }}"
       
       # 输出构建结果
       - name: Output build result
-        if: steps.should_build.outputs.should_build == 'true'
+        if: steps.should_build.outputs.should_build == 'true' && steps.docker_build.outcome == 'success'
         run: |
           echo "============================================"
           echo "Build successful!"
           echo "Image: ${{ env.DOCKER_IMAGE }}:latest"
-          echo "Version: ${{ env.DOCKER_IMAGE }}:${{ steps.meta.outputs.short_sha }}"
+          echo "Version: ${{ env.DOCKER_IMAGE }}:${{ steps.meta.outputs.version_tag }}"
           echo "Supported architectures: linux/amd64, linux/arm64"
-          echo "Upstream commit: ${{ steps.upstream.outputs.latest_commit }}"
+          echo "Upstream commit: ${{ steps.clone.outputs.latest_commit }}"
           echo "============================================"
       
       # 删除旧的workflow运行记录
       - name: Delete Workflow Runs
+        if: always()
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ github.token }}
           repository: ${{ github.repository }}
           retain_days: 0
           keep_minimum_runs: 2
-
